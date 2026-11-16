@@ -1,0 +1,544 @@
+/* تجريبي، غير مدقق، لا يُستخدم لحماية بيانات حقيقية */
+/*
+ * SHC-Guard v0.6 — Tamarin formal model
+ * =======================================
+ * Models DESIGN_FREEZE_v06.md (2026-11-16): hybrid handshake (Ed25519 +
+ * ML-DSA-65 identities, X25519 + ML-KEM-768), XChaCha20-Poly1305 abstracted
+ * as symmetric encryption under a per-message key, split-epoch positions
+ * (tx_epoch/tx_ctr and rx_epoch/rx_ctr as independent positions),
+ * direction-specific rx_digest chains, signed checkpoints (CP) chained
+ * via prev_cp_hash and anchor_head, per-direction SUSPECT challenge
+ * lifecycle (supersede / consume / expire, nonce binding), generation
+ * carried in the handshake, every message and every CP, and states
+ * ACTIVE / SUSPECT / QUARANTINED (see §2–§4, §7 of the freeze).
+ *
+ * ABSTRACTIONS (explicit — the model proves things only under these):
+ *  1. ML-KEM-768 and ML-DSA-65 are ideal primitives: KEM as an equation
+ *     kem_dec(kem_enc(pk, ss), sk) = ss; ML-DSA as a second signing key
+ *     under the standard `signing` builtin. No lattice security is modelled.
+ *  2. The ratchet is abstracted as fresh per-message keys (~mk): each
+ *     message uses a fresh key wrapped under the session key. No forward
+ *     secrecy / post-compromise security of the real ratchet is modelled.
+ *  3. The hardware counter (§8) is abstracted as a monotonic fact: the
+ *     model has no real counter; cp_seq uses a free successor function
+ *     succ/1, so "strictly increasing" is "exactly the next sequence
+ *     value". A rollback that jumps over values is not distinguished.
+ *  4. BOTH-PARTIES-ROLLBACK-TOGETHER IS OUT OF SCOPE / NOT DETECTED:
+ *     if both peers roll back to the same old state together, their
+ *     digests and cp_seq values still agree, so no rule fires. Only a
+ *     SINGLE-party rollback below a peer-held checkpoint is detected.
+ *     (Freeze §3 / §14 residual: the LocalAnchor is a stand-in, not a
+ *     trusted third party.)
+ *  5. The LocalAnchor is modelled as an append-only log (a linear fact
+ *     that only advances: AnchorHeadA), NOT as a trusted third party.
+ *     An attacker who rolls back the session state AND the anchor log
+ *     together is not modelled and defeats the anchor check.
+ *  6. The model covers replay of the most recently stored checkpoint
+ *     (seq == last stored). Replays of older-than-last checkpoints use
+ *     the same mechanism but are not enumerated as separate rules.
+ *  7. Only the A -> B direction carries messages / checkpoints; B -> A
+ *     traffic is abstracted as position advances only (rules BumpTx_B
+ *     and BumpRx_A advance the B -> A chain positions without message
+ *     content). B -> A is symmetric by role swap and is not duplicated.
+ *  8. AEAD/AAD, timestamps, revocation lists, guard_level policy,
+ *     buffer caps, outbox, 24h/60s deadlines and the atomic
+ *     session-replacement close (§4) are NOT modelled. guard_level
+ *     appears only as the constant 'L-B' carried in the transcript
+ *     and in every checkpoint. Generation is modelled as a fresh value
+ *     carried in the handshake, every message and every CP; a CP or
+ *     message whose generation differs from the session's cannot be
+ *     accepted (enforced by pattern matching on the session state),
+ *     but no lemma orders generations and no replacement handshake
+ *     is modelled.
+ *  9. Compromise is modelled as long-term-key reveal only (RevealLTK);
+ *     a fully compromised endpoint (attacker choosing ephemerals) is
+ *     NOT modelled.
+ * 10. Checkpoint cadence (every 50 messages / 24h) is not modelled;
+ *     checkpoints may be created at any time.
+ * 11. Epochs advance independently per direction (rules
+ *     AdvanceTxEpoch_A / AdvanceRxEpoch_B / AdvanceTxEpoch_B /
+ *     AdvanceRxEpoch_A); a DH ratchet step is abstracted as an epoch
+ *     advance with the counter reset to 'zero'. The digest chain value
+ *     is carried across an epoch advance unchanged (abstraction: the
+ *     real design re-keys the chain per epoch; the model does not
+ *     distinguish chain values across epochs beyond the epoch field
+ *     in the update).
+ * 12. The challenge label domain separation of freeze §7 (signed bytes
+ *     = "checkpoint-challenge" label || canonical CP when answering)
+ *     is modelled as a distinct 'CP-CHAL' tag on challenge-answer CPs.
+ *
+ * CORRECTIONS vs the v0.5 model (the v0.5 statements below were FALSE
+ * as written — found while adapting; v0.5 was never machine-checked,
+ * so the errors were never caught by a prover):
+ *  - rollback_detection: v0.5 said "no replayed checkpoint is ever
+ *    accepted", i.e. AcceptedCP(s) ==> not Ex ReplayedCP(s). That is
+ *    false: after a CP is accepted, the attacker can replay it, and
+ *    ReplayedCP(s) then coexists with AcceptedCP(s). The true
+ *    property is ORDERING: no CP is ever accepted AFTER it has been
+ *    replayed (acceptance strictly precedes any replay). The v0.6
+ *    lemma states exactly that.
+ *  - session_key_secrecy / message_key_secrecy: v0.5 guarded only
+ *    against SessionKeyRevealed. That is false: an attacker who
+ *    reveals BOTH parties' long-term keys can impersonate B to A
+ *    (forge B's signatures, decapsulate the KEM secret with B's KEM
+ *    key, choose its own DH ephemeral) and compute the session key
+ *    while A still completes the handshake. The v0.6 lemmas add the
+ *    standard guards "neither party's long-term keys were revealed".
+ *  - kci_resistance: v0.5 allowed RevealLTK(A) but did not exclude
+ *    RevealLTK(B); the v0.6 lemma excludes it, so the lemma says
+ *    only what KCI means: compromise of A's keys alone does not let
+ *    the attacker impersonate B to A.
+ *
+ * VERIFICATION STATUS (2026-11-16, this VM): NOT machine-checked.
+ * See formal/README.md for the exact commands, runtimes and results.
+ * حالة التحقق: لم يُتحقق من هذا النموذج آليًا — لم يُثبَت أي برهان
+ * (lemma) منه على هذا الجهاز، فلا يُعرض على أنه موثّق/مُتحقق منه.
+ */
+
+theory SHCGuardV06
+begin
+
+builtins: signing, diffie-hellman, hashing, symmetric-encryption
+
+functions: kem_pk/1, kem_enc/2, kem_dec/2, succ/1
+
+equations: kem_dec(kem_enc(kem_pk(sk), ss), sk) = ss
+
+/* Equality checks used for signature verification and digest checks. */
+restriction Eq_check:
+  "All x y #i. Eq(x, y) @i ==> x = y"
+
+/* ------------------------------------------------------------------ */
+/* Setup: identities (Ed25519 + ML-DSA-65 + ML-KEM-768 key pairs).    */
+/* ------------------------------------------------------------------ */
+
+rule Setup:
+  [ Fr(~ltkEd), Fr(~ltkDsa), Fr(~kemSk) ]
+  -->
+  [ !Identity($P, pk(~ltkEd), pk(~ltkDsa), kem_pk(~kemSk))
+  , !Ltk($P, ~ltkEd, ~ltkDsa, ~kemSk)
+  , Out(<$P, pk(~ltkEd), pk(~ltkDsa), kem_pk(~kemSk)>) ]
+
+rule RevealLTK:
+  [ !Ltk($P, ltkEd, ltkDsa, kemSk) ]
+  --[ RevealLTK($P) ]->
+  [ Out(ltkEd), Out(ltkDsa), Out(kemSk) ]
+
+/* ------------------------------------------------------------------ */
+/* Handshake (§2, §4): dual-signed transcript, X25519 + ML-KEM-768,  */
+/* generation carried from the first message.                         */
+/* ------------------------------------------------------------------ */
+
+/* A initiates: ephemeral X25519 share + KEM encapsulation to B's
+   ML-KEM public key, both identity signatures over the partial
+   transcript. */
+rule HS_A1:
+  let ct     = kem_enc(kemPkB, ~ss)
+      hs1sig = <~hsid, ~gen, $A, $B, 'g'^~ephA, ct, ~nA>
+  in
+  [ !Ltk($A, ltkEdA, ltkDsaA, kemSkA)
+  , !Identity($B, pkEdB, pkDsaB, kemPkB)
+  , Fr(~ephA), Fr(~nA), Fr(~ss), Fr(~hsid), Fr(~gen) ]
+  -->
+  [ St_A1($A, $B, ~ephA, ~nA, ~ss, ~hsid, ~gen)
+  , Out(<'hs1', $A, $B, ~hsid, ~gen, 'g'^~ephA, ct, ~nA
+       , sign(hs1sig, ltkEdA), sign(hs1sig, ltkDsaA)>) ]
+
+/* B answers: verifies both of A's signatures, decapsulates, derives
+   the session key, signs the full transcript with both keys.
+   Direction-specific chain inits (§2): the A->B chain init binds the
+   direction and the sender; the B->A chain init binds its own. */
+rule HS_B1:
+  let ss = kem_dec(ct, kemSkB)
+      k  = h(<'SHC-Guard/v0.6', hsid, gen, gxA^~ephB, ss, $A, $B>)
+      tr = <'SHC-Guard/v0.6', hsid, gen, $A, $B, gxA, 'g'^~ephB, ct, nA, ~nB, 'L-B'>
+      d0A2B = h(<'SHC-Guard/v0.6/rx-chain', hsid, 'A-to-B', $A, 'init'>)
+      d0B2A = h(<'SHC-Guard/v0.6/rx-chain', hsid, 'B-to-A', $B, 'init'>)
+      v1 = verify(sigEd, <hsid, gen, $A, $B, gxA, ct, nA>, pkEdA)
+      v2 = verify(sigDsa, <hsid, gen, $A, $B, gxA, ct, nA>, pkDsaA)
+  in
+  [ !Ltk($B, ltkEdB, ltkDsaB, kemSkB)
+  , !Identity($A, pkEdA, pkDsaA, kemPkA)
+  , Fr(~ephB), Fr(~nB)
+  , In(<'hs1', $A, $B, hsid, gen, gxA, ct, nA, sigEd, sigDsa>) ]
+  --[ Running($B, $A, tr), Eq(v1, true), Eq(v2, true) ]->
+  [ St_B1($B, $A, k, tr, hsid, gen)
+  , St_SessB($A, $B, hsid, gen, k, tr, d0A2B, 'e0', 'zero', d0B2A, 'e0', 'zero')
+  , LastCP_B($A, $B, 'zero', 'zero', 'anchor-zero')
+  , !Sess($A, $B, k)
+  , Out(<'hs2', $B, $A, hsid, gen, 'g'^~ephB, ~nB
+       , sign(tr, ltkEdB), sign(tr, ltkDsaB)>) ]
+
+/* A completes: verifies both of B's signatures over the full
+   transcript, derives the same session key, confirms with both
+   of its own signatures (key confirmation). */
+rule HS_A2:
+  let ct = kem_enc(kemPkB, ss)
+      k  = h(<'SHC-Guard/v0.6', hsid, gen, gxB^ephA, ss, $A, $B>)
+      tr = <'SHC-Guard/v0.6', hsid, gen, $A, $B, 'g'^ephA, gxB, ct, nA, nB, 'L-B'>
+      d0A2B = h(<'SHC-Guard/v0.6/rx-chain', hsid, 'A-to-B', $A, 'init'>)
+      d0B2A = h(<'SHC-Guard/v0.6/rx-chain', hsid, 'B-to-A', $B, 'init'>)
+      v1 = verify(sigEdB, tr, pkEdB)
+      v2 = verify(sigDsaB, tr, pkDsaB)
+  in
+  [ St_A1($A, $B, ephA, nA, ss, hsid, gen)
+  , !Ltk($A, ltkEdA, ltkDsaA, kemSkA)
+  , !Identity($B, pkEdB, pkDsaB, kemPkB)
+  , In(<'hs2', $B, $A, hsid, gen, gxB, nB, sigEdB, sigDsaB>) ]
+  --[ Commit($A, $B, tr), Running($A, $B, tr), AgreeK($A, $B, k)
+    , AnchorHeadKnown('anchor-zero')
+    , Eq(v1, true), Eq(v2, true) ]->
+  [ St_SessA($A, $B, hsid, gen, k, tr, d0A2B, 'e0', 'zero', d0B2A, 'e0', 'zero')
+  , CpSeqA($A, $B, 'zero', 'zero')
+  , AnchorHeadA($A, $B, 'anchor-zero')
+  , !Sess($A, $B, k)
+  , Out(<'hs3', $A, $B, hsid, gen, sign(tr, ltkEdA), sign(tr, ltkDsaA)>) ]
+
+/* B verifies A's confirmation. */
+rule HS_B2:
+  let v1 = verify(sigEdA, tr, pkEdA)
+      v2 = verify(sigDsaA, tr, pkDsaA)
+  in
+  [ St_B1($B, $A, k, tr, hsid, gen)
+  , !Identity($A, pkEdA, pkDsaA, kemPkA)
+  , In(<'hs3', $A, $B, hsid, gen, sigEdA, sigDsaA>) ]
+  --[ Commit($B, $A, tr), AgreeK($B, $A, k)
+    , Eq(v1, true), Eq(v2, true) ]->
+  [ Done_B($B, $A, hsid) ]
+
+/* Session-key compromise (for the secrecy lemmas' premises). */
+rule RevealSessionKey:
+  [ !Sess($A, $B, k) ]
+  --[ SessionKeyRevealed($A, $B) ]->
+  [ Out(k) ]
+
+/* ------------------------------------------------------------------ */
+/* Messages (§2, §4): fresh per-message key, split-epoch positions,  */
+/* tx_digest chain keyed by (tx_epoch, tx_ctr).                      */
+/* ------------------------------------------------------------------ */
+
+rule SendMsg_A:
+  let ct = senc(~msg, ~mk)
+      d2 = h(<d, txe, txc, h(ct)>)
+  in
+  [ St_SessA($A, $B, hsid, gen, k, tr, d, txe, txc, rxd, rxe, rxcmax)
+  , Fr(~mk), Fr(~msg) ]
+  --[ MsgKey($A, $B, ~mk) ]->
+  [ St_SessA($A, $B, hsid, gen, k, tr, d2, txe, succ(txc), rxd, rxe, rxcmax)
+  , Out(<'msg', $A, $B, gen, txe, txc, ct, senc(~mk, k), d2>) ]
+
+/* In-order receipt only (out-of-order buffering is not modelled);
+   the claimed digest must equal the locally computed chain value.
+   The message's (tx_epoch, tx_ctr) must equal B's (rx_epoch, rx_ctr). */
+rule RecvMsg_B:
+  let mk = sdec(encmk, k)
+      msg = sdec(ct, mk)
+      d3 = h(<d, rxe, rxc, h(ct)>)
+  in
+  [ St_SessB($A, $B, hsid, gen, k, tr, d, rxe, rxc, txd, txe, txc)
+  , In(<'msg', $A, $B, gen, rxe, rxc, ct, encmk, d2>) ]
+  --[ RecvMsg($A, $B, rxc), Eq(d2, d3) ]->
+  [ St_SessB($A, $B, hsid, gen, k, tr, d3, rxe, succ(rxc), txd, txe, txc) ]
+
+/* Epochs advance independently per direction (§2): a DH ratchet step
+   in one direction advances only that direction's epoch and resets
+   its counter to zero. */
+rule AdvanceTxEpoch_A:
+  [ St_SessA($A, $B, hsid, gen, k, tr, d, txe, txc, rxd, rxe, rxcmax) ]
+  --[ TxEpochAdvanced($A, $B, txe) ]->
+  [ St_SessA($A, $B, hsid, gen, k, tr, d, succ(txe), 'zero', rxd, rxe, rxcmax) ]
+
+rule AdvanceRxEpoch_B:
+  [ St_SessB($A, $B, hsid, gen, k, tr, d, rxe, rxc, txd, txe, txc) ]
+  --[ RxEpochAdvanced($A, $B, rxe) ]->
+  [ St_SessB($A, $B, hsid, gen, k, tr, d, succ(rxe), 'zero', txd, txe, txc) ]
+
+rule AdvanceTxEpoch_B:
+  [ St_SessB($A, $B, hsid, gen, k, tr, d, rxe, rxc, txd, txe, txc) ]
+  --[ TxEpochAdvanced($B, $A, txe) ]->
+  [ St_SessB($A, $B, hsid, gen, k, tr, d, rxe, rxc, txd, succ(txe), 'zero') ]
+
+rule AdvanceRxEpoch_A:
+  [ St_SessA($A, $B, hsid, gen, k, tr, d, txe, txc, rxd, rxe, rxcmax) ]
+  --[ RxEpochAdvanced($B, $A, rxe) ]->
+  [ St_SessA($A, $B, hsid, gen, k, tr, d, txe, txc, rxd, succ(rxe), 'zero') ]
+
+/* Abstract B -> A traffic (content not modelled): A advances its
+   receive chain, B advances its send chain, independently. */
+rule BumpRx_A:
+  let rxd2 = h(<rxd, rxe, rxcmax>)
+  in
+  [ St_SessA($A, $B, hsid, gen, k, tr, d, txe, txc, rxd, rxe, rxcmax) ]
+  --[ RxAdvanced($B, $A, rxcmax) ]->
+  [ St_SessA($A, $B, hsid, gen, k, tr, d, txe, txc, rxd2, rxe, succ(rxcmax)) ]
+
+rule BumpTx_B:
+  let txd2 = h(<txd, txe, txc>)
+  in
+  [ St_SessB($A, $B, hsid, gen, k, tr, d, rxe, rxc, txd, txe, txc) ]
+  --[ TxAdvanced($B, $A, txc) ]->
+  [ St_SessB($A, $B, hsid, gen, k, tr, d, rxe, rxc, txd2, txe, succ(txc)) ]
+
+/* ------------------------------------------------------------------ */
+/* Checkpoints (§2, §3): dual-signed CP, split epochs, prev_cp_hash  */
+/* chaining, anchor_head extension, generation. The CP's (tx_epoch,  */
+/* tx_ctr) must equal the carrying message's send position, and its   */
+/* (rx_epoch, rx_ctr_max, rx_digest) must equal the peer's current   */
+/* send position and tx-chain head.                                   */
+/* ------------------------------------------------------------------ */
+
+/* A creates a checkpoint. challenge_nonce is 'zero-nonce' unless the
+   CP answers a SUSPECT challenge (see AnswerChallenge_A). The CP
+   carries the anchor head known BEFORE this CP; registering the CP
+   then advances the append-only anchor log. */
+rule CreateCP_A:
+  let s2     = succ(seq)
+      cp     = <'CP', hsid, gen, $A, s2, txe, txc, rxe, rxcmax, rxd, 'L-B', prevhash, ah, 'zero-nonce'>
+      sigEd  = sign(cp, ltkEdA)
+      sigDsa = sign(cp, ltkDsaA)
+      d2     = h(<d, txe, txc, h(<cp, sigEd, sigDsa>)>)
+      newah  = h(<'SHC-Guard/v0.6/anchor-entry', ah, h(cp), s2>)
+  in
+  [ St_SessA($A, $B, hsid, gen, k, tr, d, txe, txc, rxd, rxe, rxcmax)
+  , CpSeqA($A, $B, seq, prevhash)
+  , AnchorHeadA($A, $B, ah)
+  , !Ltk($A, ltkEdA, ltkDsaA, kemSkA) ]
+  --[ CPCreated($A, $B, s2), AnchorHeadKnown(ah), AnchorHeadKnown(newah) ]->
+  [ St_SessA($A, $B, hsid, gen, k, tr, d2, txe, succ(txc), rxd, rxe, rxcmax)
+  , CpSeqA($A, $B, s2, h(cp))
+  , AnchorHeadA($A, $B, newah)
+  , !SeenCPMsg($A, $B, <'cpm', $A, $B, txc, cp, sigEd, sigDsa, d2>)
+  , Out(<'cpm', $A, $B, txc, cp, sigEd, sigDsa, d2>) ]
+
+/* B accepts a checkpoint: both signatures verify, cp_seq is exactly
+   the next value, prev_cp_hash equals the stored CP hash, anchor_head
+   equals the stored anchor head (extension), (tx_epoch, tx_ctr)
+   matches B's receive position, (rx_epoch, rx_ctr_max, rx_digest)
+   matches B's send position and tx-chain head, and the digest
+   matches the local chain. */
+rule RecvCP_B:
+  let s2 = succ(lastseq)
+      cp = <'CP', hsid, gen, $A, s2, rxe, rxc, txe, txc, txd, 'L-B', lasthash, storedah, 'zero-nonce'>
+      v1 = verify(sigEd, cp, pkEdA)
+      v2 = verify(sigDsa, cp, pkDsaA)
+      d3 = h(<d, rxe, rxc, h(<cp, sigEd, sigDsa>)>)
+      newah = h(<'SHC-Guard/v0.6/anchor-entry', storedah, h(cp), s2>)
+  in
+  [ St_SessB($A, $B, hsid, gen, k, tr, d, rxe, rxc, txd, txe, txc)
+  , LastCP_B($A, $B, lastseq, lasthash, storedah)
+  , !Identity($A, pkEdA, pkDsaA, kemPkA)
+  , In(<'cpm', $A, $B, rxc, cp, sigEd, sigDsa, d2>) ]
+  --[ AcceptedCP(s2), AcceptedCPWithPrev(s2, lasthash), CPHashAccepted(h(cp))
+    , AcceptedAnchorHead(storedah)
+    , Eq(v1, true), Eq(v2, true), Eq(d2, d3) ]->
+  [ St_SessB($A, $B, hsid, gen, k, tr, d3, rxe, succ(rxc), txd, txe, txc)
+  , LastCP_B($A, $B, s2, h(cp), newah) ]
+
+/* Adversary (or a rolled-back party) replays a previously seen CP. */
+rule ReplayOldCP:
+  [ !SeenCPMsg($A, $B, <'cpm', $A, $B, ctr
+     , <'CP', hsid, gen, $A, s, txe, txc, rxe, rxcmax, rxd, 'L-B', prevhash, ah, nonce>
+     , sigEd, sigDsa, d2>) ]
+  --[ ReplayedCP(s) ]->
+  [ Out(<'cpm', $A, $B, ctr
+     , <'CP', hsid, gen, $A, s, txe, txc, rxe, rxcmax, rxd, 'L-B', prevhash, ah, nonce>
+     , sigEd, sigDsa, d2>) ]
+
+/* B receives a replay of the checkpoint it already holds: cp_seq is
+   not greater than the stored one -> SUSPECT (freeze §6 rule 4 as
+   revised by §6: SUSPECT + challenge, not a silent reject). */
+rule DetectRollback_B:
+  let cp = <'CP', hsid, gen, $A, lastseq, txe, txc, rxe, rxcmax, rxd, 'L-B', prevhash, ah, nonce>
+      v1 = verify(sigEd, cp, pkEdA)
+      v2 = verify(sigDsa, cp, pkDsaA)
+  in
+  [ St_SessB($A, $B, hsid, gen, k, tr, d, rxe, rxc, txd, txe, txc)
+  , LastCP_B($A, $B, lastseq, lasthash, storedah)
+  , !Identity($A, pkEdA, pkDsaA, kemPkA)
+  , In(<'cpm', $A, $B, ctr2, cp, sigEd, sigDsa, d2>) ]
+  --[ RollbackDetected(lastseq), SuspectRaised($A, $B, lastseq)
+    , Eq(v1, true), Eq(v2, true) ]->
+  [ St_SessB($A, $B, hsid, gen, k, tr, d, rxe, rxc, txd, txe, txc)
+  , LastCP_B($A, $B, lastseq, lasthash, storedah) ]
+
+/* ------------------------------------------------------------------ */
+/* SUSPECT challenge (§7): one outstanding challenge per session PER  */
+/* DIRECTION (this model covers the B -> A direction; the A -> B      */
+/* direction is symmetric by role swap). Issuing a new challenge      */
+/* SUPERSEDES the old one; a nonce is CONSUMED on first successful    */
+/* verification and the consumed record persists; expiry moves the    */
+/* session to QUARANTINED with no late acceptance.                    */
+/* ------------------------------------------------------------------ */
+
+rule IssueChallenge_B:
+  [ St_SessB($A, $B, hsid, gen, k, tr, d, rxe, rxc, txd, txe, txc)
+  , LastCP_B($A, $B, lastseq, lasthash, storedah)
+  , Fr(~n) ]
+  --[ ChallengeIssued(~n), EnterSuspect($A, $B) ]->
+  [ St_SuspectB($A, $B, hsid, gen, k, tr, d, rxe, rxc, txd, txe, txc, 'c1', ~n)
+  , LastCP_B($A, $B, lastseq, lasthash, storedah)
+  , Out(<'chal', $B, $A, 'c1', ~n>) ]
+
+/* Issuing a new challenge supersedes the old one explicitly: the old
+   nonce is invalidated and recorded as superseded. */
+rule IssueChallengeAgain_B:
+  [ St_SuspectB($A, $B, hsid, gen, k, tr, d, rxe, rxc, txd, txe, txc, chid, nold)
+  , LastCP_B($A, $B, lastseq, lasthash, storedah)
+  , Fr(~n2) ]
+  --[ ChallengeIssued(~n2), ChallengeSuperseded(nold) ]->
+  [ St_SuspectB($A, $B, hsid, gen, k, tr, d, rxe, rxc, txd, txe, txc, succ(chid), ~n2)
+  , LastCP_B($A, $B, lastseq, lasthash, storedah)
+  , Out(<'chal', $B, $A, succ(chid), ~n2>) ]
+
+/* A answers the challenge with a checkpoint carrying the nonce. The
+   'CP-CHAL' tag is the domain separation of freeze §7: the signed
+   bytes use the checkpoint-challenge label when challenge_nonce != 0. */
+rule AnswerChallenge_A:
+  let s2     = succ(seq)
+      cp     = <'CP-CHAL', hsid, gen, $A, s2, txe, txc, rxe, rxcmax, rxd, 'L-B', prevhash, ah, n>
+      sigEd  = sign(cp, ltkEdA)
+      sigDsa = sign(cp, ltkDsaA)
+      d2     = h(<d, txe, txc, h(<cp, sigEd, sigDsa>)>)
+      newah  = h(<'SHC-Guard/v0.6/anchor-entry', ah, h(cp), s2>)
+  in
+  [ St_SessA($A, $B, hsid, gen, k, tr, d, txe, txc, rxd, rxe, rxcmax)
+  , CpSeqA($A, $B, seq, prevhash)
+  , AnchorHeadA($A, $B, ah)
+  , !Ltk($A, ltkEdA, ltkDsaA, kemSkA)
+  , In(<'chal', $B, $A, chid, n>) ]
+  --[ ChallengeAnswered(n), AnchorHeadKnown(ah), AnchorHeadKnown(newah) ]->
+  [ St_SessA($A, $B, hsid, gen, k, tr, d2, txe, succ(txc), rxd, rxe, rxcmax)
+  , CpSeqA($A, $B, s2, h(cp))
+  , AnchorHeadA($A, $B, newah)
+  , !SeenCPMsg($A, $B, <'cpm', $A, $B, txc, cp, sigEd, sigDsa, d2>)
+  , Out(<'cpm', $A, $B, txc, cp, sigEd, sigDsa, d2>) ]
+
+/* B accepts the challenge answer only if: both signatures verify,
+   cp_seq is the next value, prev_cp_hash and anchor_head extend the
+   stored values, the nonce matches the outstanding challenge,
+   (tx_epoch, tx_ctr) matches the carrying position, (rx_epoch,
+   rx_ctr_max, rx_digest) matches B's send position and tx-chain
+   head, and the digest matches the local chain. Success consumes
+   the nonce (persisted) and returns the session to ACTIVE — the
+   atomic commit of freeze §7. */
+rule VerifyChallengeAnswer_B:
+  let s2 = succ(lastseq)
+      cp = <'CP-CHAL', hsid, gen, $A, s2, rxe, rxc, txe, txc, txd, 'L-B', lasthash, storedah, n>
+      v1 = verify(sigEd, cp, pkEdA)
+      v2 = verify(sigDsa, cp, pkDsaA)
+      d3 = h(<d, rxe, rxc, h(<cp, sigEd, sigDsa>)>)
+      newah = h(<'SHC-Guard/v0.6/anchor-entry', storedah, h(cp), s2>)
+  in
+  [ St_SuspectB($A, $B, hsid, gen, k, tr, d, rxe, rxc, txd, txe, txc, chid, n)
+  , LastCP_B($A, $B, lastseq, lasthash, storedah)
+  , !Identity($A, pkEdA, pkDsaA, kemPkA)
+  , In(<'cpm', $A, $B, rxc, cp, sigEd, sigDsa, d2>) ]
+  --[ ChallengeAccepted(n), NonceConsumed(n)
+    , AcceptedCPWithPrev(s2, lasthash), CPHashAccepted(h(cp))
+    , AcceptedAnchorHead(storedah)
+    , Eq(v1, true), Eq(v2, true), Eq(d2, d3) ]->
+  [ St_SessB($A, $B, hsid, gen, k, tr, d3, rxe, succ(rxc), txd, txe, txc)
+  , LastCP_B($A, $B, s2, h(cp), newah)
+  , !ConsumedNonce($A, $B, n) ]
+
+/* Challenge expiry -> QUARANTINED (§7, §9). No late acceptance: the
+   suspect state (and its nonce) is gone, so a late answer cannot
+   match any outstanding challenge. */
+rule ChallengeExpire_B:
+  [ St_SuspectB($A, $B, hsid, gen, k, tr, d, rxe, rxc, txd, txe, txc, chid, n)
+  , LastCP_B($A, $B, lastseq, lasthash, storedah) ]
+  --[ ChallengeExpired(n), Quarantined($A, $B) ]->
+  [ St_QuarB($A, $B, hsid)
+  , LastCP_B($A, $B, lastseq, lasthash, storedah) ]
+
+/* ------------------------------------------------------------------ */
+/* Lemmas                                                             */
+/* ------------------------------------------------------------------ */
+
+/* (a) Secrecy of message keys, unless the session key was revealed
+   or either party's long-term keys were revealed (corrected vs v0.5:
+   both-LTK reveal lets the attacker impersonate B to A and compute
+   the session key, so secrecy cannot be claimed in that case). */
+lemma message_key_secrecy:
+  "All A B mk #i.
+     MsgKey(A, B, mk) @i
+     & not (Ex #r. SessionKeyRevealed(A, B) @r)
+     & not (Ex #r. RevealLTK(A) @r)
+     & not (Ex #r. RevealLTK(B) @r)
+     ==> not (Ex #j. K(mk) @j)"
+
+/* Secrecy of session keys, with the same guards as above. */
+lemma session_key_secrecy:
+  "All A B k #i.
+     AgreeK(A, B, k) @i
+     & not (Ex #r. SessionKeyRevealed(A, B) @r)
+     & not (Ex #r. RevealLTK(A) @r)
+     & not (Ex #r. RevealLTK(B) @r)
+     ==> not (Ex #j. K(k) @j)"
+
+/* (b) Mutual authentication: agreement on the transcript and on the
+   peer identity, provided the peer's long-term keys were not revealed. */
+lemma mutual_authentication:
+  "All A B tr #i.
+     Commit(A, B, tr) @i
+     & not (Ex #r. RevealLTK(B) @r)
+     ==> Ex #j. Running(B, A, tr) @j"
+
+/* (c) KCI resistance: even if A's long-term keys are revealed, a
+   session key A agreed with B stays secret — provided B's long-term
+   keys were NOT revealed (corrected vs v0.5, which omitted that
+   guard: with B's keys revealed the attacker can impersonate B). */
+lemma kci_resistance:
+  "All A B k #i.
+     AgreeK(A, B, k) @i
+     & (Ex #r. RevealLTK(A) @r)
+     & not (Ex #r. RevealLTK(B) @r)
+     ==> not (Ex #j. K(k) @j)"
+
+/* (d) Rollback detection (CORRECTED vs v0.5): v0.5 claimed no replayed
+   checkpoint is ever accepted, which is false — after acceptance the
+   attacker can still replay the CP. The true property is ordering:
+   no checkpoint is ever accepted AFTER it has been replayed. */
+lemma rollback_detection:
+  "All s #i #j.
+     AcceptedCP(s) @i
+     & ReplayedCP(s) @j
+     ==> #i < #j"
+
+/* SUSPECT challenge binding: a challenge answer is accepted only for
+   a nonce that was actually issued as a challenge. */
+lemma suspect_challenge_binding:
+  "All n #i.
+     ChallengeAccepted(n) @i
+     ==> Ex #j. ChallengeIssued(n) @j"
+
+/* A consumed challenge nonce is never accepted a second time. */
+lemma challenge_nonce_single_use:
+  "All n #i #j.
+     ChallengeAccepted(n) @i
+     & ChallengeAccepted(n) @j
+     ==> #i = #j"
+
+/* A superseded challenge nonce is never accepted. */
+lemma challenge_supersede_binding:
+  "All n #i.
+     ChallengeAccepted(n) @i
+     ==> not (Ex #j. ChallengeSuperseded(n) @j)"
+
+/* CP chaining: every accepted CP (except the first, whose prev hash
+   is 'zero') extends a previously accepted CP hash. */
+lemma cp_chain_continuity:
+  "All s prev #i.
+     AcceptedCPWithPrev(s, prev) @i
+     ==> (prev = 'zero')
+       | (Ex #j. CPHashAccepted(prev) @j & #j < #i)"
+
+/* Anchor extension: every anchor head B accepts was a head A
+   actually knew/registered (the append-only log advances only
+   through A's registrations). */
+lemma anchor_head_extends:
+  "All ah #i.
+     AcceptedAnchorHead(ah) @i
+     ==> Ex #j. AnchorHeadKnown(ah) @j"
+
+end
